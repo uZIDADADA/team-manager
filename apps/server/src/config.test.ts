@@ -3,6 +3,9 @@ import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { ensureHashedAdminPassword, loadRuntimeConfig, parseRuntimeConfig } from './config.js';
 import { verifyPasswordHash } from './auth/password.js';
 
@@ -50,6 +53,37 @@ test('relative paths and runtime profiles are resolved from the fixed config roo
   assert.match(development.app.databaseUrl, /@127\.0\.0\.1:5433\//);
   assert.equal(compose.app.webDistDir, '/app/apps/web/dist');
   assert.match(compose.app.databaseUrl, /@postgres:5432\//);
+});
+
+test('worker transport requires a separate token and shares it through runtime config', () => {
+  const hash = '$2b$12$012345678901234567890u0123456789012345678901234567890';
+  const config = validConfig(hash).replace(
+    'curlCffiUrls: { development: null, compose: null }',
+    'curlCffiUrls: { development: http://127.0.0.1:3011, compose: http://worker:8080 }'
+  );
+  for (const profile of ['development', 'compose'] as const) {
+    assert.throws(() => parseRuntimeConfig(config, '/tmp/config.yaml', profile), /curlCffiToken/);
+    assert.throws(() => parseRuntimeConfig(config.replace('transport:', 'transport:\n  curlCffiToken: short'), '/tmp/config.yaml', profile), /curlCffiToken/);
+    const token = 'test-worker-token-' + 'a'.repeat(32);
+    const runtime = parseRuntimeConfig(config.replace('transport:', `transport:\n  curlCffiToken: ${token}`), '/tmp/config.yaml', profile);
+    assert.equal(runtime.app.curlCffiToken, token);
+  }
+});
+
+test('config launcher passes the YAML worker token and clears a stale inherited token', async () => {
+  const hash = '$2b$12$012345678901234567890u0123456789012345678901234567890';
+  const directory = await mkdtemp(join(tmpdir(), 'team-manager-worker-config-'));
+  const path = join(directory, 'config.yaml');
+  for (const token of ['test-worker-token-' + 'a'.repeat(32), '']) {
+    await writeFile(path, validConfig(hash).replace('transport:', `transport:\n  curlCffiToken: ${token || 'null'}`), { mode: 0o600 });
+    const { stdout } = await promisify(execFile)(process.execPath, [
+      ...process.execArgv.filter((arg) => arg !== '--test'),
+      fileURLToPath(new URL('./configCli.ts', import.meta.url)),
+      'exec', '--config', path, '--profile', 'development', '--',
+      process.execPath, '-e', 'process.stdout.write(process.env.TEAMMGR_CURL_CFFI_TOKEN ?? "missing")'
+    ], { env: { ...process.env, TEAMMGR_CURL_CFFI_TOKEN: 'stale-token-that-must-not-be-used' } });
+    assert.equal(stdout, token);
+  }
 });
 
 function validConfig(password: string): string {

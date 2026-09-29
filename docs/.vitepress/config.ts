@@ -17,6 +17,7 @@ export default defineConfig({
         text: '使用手册',
         items: [
           { text: '业务流程总览', link: '/guide/' },
+          { text: 'VPS 部署', link: '/guide/vps-deployment' },
           { text: '账号与 Workspace', link: '/guide/' },
           { text: '账号与 Workspace 运营 SOP', link: '/guide/account-cleanup-and-refresh-sop' },
           { text: 'Workspace 席位计价与优惠码', link: '/guide/workspace-seat-pricing-and-promotions' },

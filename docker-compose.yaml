@@ -1,6 +1,100 @@
+# Use scripts/deploy.sh: runtime variables are derived from private config.yaml.
+x-app: &app
+  image: team-manager:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+  init: true
+  volumes:
+    - type: bind
+      source: ${TEAMMGR_RUNTIME_DIR:?Use scripts/deploy.sh with a private runtime directory}
+      target: /runtime
+      bind:
+        create_host_path: false
+  extra_hosts:
+    - host.docker.internal:host-gateway
+  logging: &logging
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
 services:
-  team-manager:
-    image: team-manager:local
+  postgres:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${TEAMMGR_POSTGRES_DB:?Use scripts/deploy.sh}
+      POSTGRES_USER: ${TEAMMGR_POSTGRES_USER:?Use scripts/deploy.sh}
+      POSTGRES_PASSWORD: ${TEAMMGR_POSTGRES_PASSWORD:?Use scripts/deploy.sh}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    logging: *logging
+
+  curl-cffi-worker:
+    image: team-manager-worker:local
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ./apps/curl-cffi-worker
+    restart: unless-stopped
+    init: true
+    environment:
+      TEAMMGR_CHATGPT_BASE_URL: ${TEAMMGR_CHATGPT_BASE_URL:?Use scripts/deploy.sh}
+      TEAMMGR_CHATGPT_PROXY: ${TEAMMGR_CHATGPT_PROXY:-}
+      TEAMMGR_CURL_CFFI_IMPERSONATE: ${TEAMMGR_CURL_CFFI_IMPERSONATE:?Use scripts/deploy.sh}
+      TEAMMGR_CURL_CFFI_TIMEOUT: ${TEAMMGR_CURL_CFFI_TIMEOUT:?Use scripts/deploy.sh}
+      TEAMMGR_CURL_CFFI_PORT: ${TEAMMGR_CURL_CFFI_PORT:?Use scripts/deploy.sh}
+      TEAMMGR_CURL_CFFI_TOKEN: ${TEAMMGR_CURL_CFFI_TOKEN:?Use scripts/deploy.sh}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['TEAMMGR_CURL_CFFI_PORT'] + '/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    logging: *logging
+
+  migrate:
+    <<: *app
+    profiles: [tools]
+    restart: "no"
+    command: [node, apps/server/dist/database/cli.js, migrate, --config, /runtime/config.yaml, --profile, compose]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  team-manager:
+    <<: *app
+    restart: unless-stopped
+    command: [node, apps/server/dist/index.js, --config, /runtime/config.yaml, --profile, compose]
+    ports:
+      - "127.0.0.1:${TEAMMGR_SERVER_PORT:?Use scripts/deploy.sh}:${TEAMMGR_SERVER_PORT:?Use scripts/deploy.sh}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      curl-cffi-worker:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - --input-type=module
+        - -e
+        - "const r = await fetch('http://127.0.0.1:${TEAMMGR_SERVER_PORT:?Use scripts/deploy.sh}/health', { signal: AbortSignal.timeout(3000) }); if (!r.ok || !(await r.json()).ok) process.exit(1)"
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+volumes:
+  postgres-data:

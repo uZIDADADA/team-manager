@@ -1,16 +1,52 @@
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open, readFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { stringify } from 'yaml';
 import { loadRuntimeConfig, type RuntimeConfig, type RuntimeProfile } from './config.js';
 import { isSupportedBcryptHash } from './auth/password.js';
+import { SecretCipher } from './secretCipher.js';
 
 async function main(): Promise<void> {
   const command = process.argv.slice(2).find((argument) => argument !== '--');
   if (command === 'exec') return executeWithConfig();
   if (command === 'migrate-env') return migrateEnv();
-  throw new Error('Usage: config exec --config <path> --profile <development|compose> -- <command> [args...] | config migrate-env --from <path> --to <path>');
+  if (command === 'compose-env') return composeEnvironment();
+  throw new Error('Usage: config exec --config <path> --profile <development|compose> -- <command> [args...] | config compose-env --config <path> | config migrate-env --from <path> --to <path>');
+}
+
+// NUL-delimited assignments are consumed without eval by scripts/deploy.sh.
+// Never print this command's output to a terminal: it contains deployment secrets.
+async function composeEnvironment(): Promise<void> {
+  const configPath = resolve(requiredArgument('--config'));
+  const runtime = await loadRuntimeConfig(configPath, 'compose');
+  const { app, deployment } = runtime;
+  const root = dirname(configPath);
+  for (const path of [app.dataDir, app.artifactDir, app.upstreamTraceFile].filter((path): path is string => !!path)) {
+    const child = relative(root, path);
+    if (!child || child === '..' || child.startsWith('../') || isAbsolute(child)) {
+      throw new Error('Compose 数据与制品路径必须位于挂载的配置目录内；建议使用 ./data 和 ./data/artifacts');
+    }
+  }
+  if (app.webDistDir !== '/app/apps/web/dist') throw new Error('server.webDistDirs.compose 必须为 /app/apps/web/dist');
+  const database = new URL(app.databaseUrl);
+  if (database.hostname !== 'postgres' || database.port !== '5432') throw new Error('database.hosts.compose 必须指向 postgres:5432');
+  if (app.curlCffiUrl !== `http://curl-cffi-worker:${deployment.worker.port}`) {
+    throw new Error('transport.curlCffiUrls.compose 必须指向 curl-cffi-worker，并与 deployment.worker.ports.compose 一致');
+  }
+  new SecretCipher(app.dataEncryptionKey, app.dataEncryptionKeyVersion);
+  if (app.jwtSecret.length < 32 || app.jwtSecret.startsWith('replace-')) throw new Error('server.jwtSecret 必须使用至少 32 字符的随机密钥');
+  const environment = {
+    ...runtimeEnvironment(runtime),
+    TEAMMGR_CHATGPT_PROXY: deployment.worker.chatgptProxy ?? '',
+    TEAMMGR_SERVER_PORT: String(app.port),
+  };
+  const assignments = Object.entries(environment).map(([key, value]) => {
+    if (value?.includes('\0')) throw new Error(`${key} 不得包含 NUL 字符`);
+    return `${key}=${value ?? ''}\0`;
+  });
+  process.stdout.write(assignments.join(''));
 }
 
 async function executeWithConfig(): Promise<void> {
@@ -58,6 +94,7 @@ export function runtimeEnvironment(runtime: RuntimeConfig): NodeJS.ProcessEnv {
     TEAMMGR_CURL_CFFI_IMPERSONATE: worker.impersonate,
     TEAMMGR_CURL_CFFI_TIMEOUT: String(worker.requestTimeoutSeconds),
     TEAMMGR_CURL_CFFI_PORT: String(worker.port),
+    TEAMMGR_CURL_CFFI_TOKEN: runtime.app.curlCffiToken ?? '',
     TEAMMGR_DEV_API_TARGET: runtime.deployment.web.devApiTarget,
   });
 }
@@ -134,6 +171,7 @@ function migrationDocument(env: Record<string, string>, configRoot: string): Rec
       },
     },
     transport: {
+      curlCffiToken: env.TEAMMGR_CURL_CFFI_TOKEN || randomBytes(32).toString('base64url'),
       curlCffiUrls: {
         development: env.TEAMMGR_CURL_CFFI_URL || 'http://127.0.0.1:3011',
         compose: 'http://curl-cffi-worker:8080',

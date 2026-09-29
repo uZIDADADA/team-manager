@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { appendPrivateFile, ensurePrivateDirectory } from './privateDataFile.js';
+import { requireWorkerToken } from './auth/workerToken.js';
 
 export interface HttpRequest {
   method: string;
@@ -86,17 +87,20 @@ class TransportError extends Error {
  */
 export class CurlCffiTransport implements Transport {
   private readonly endpoint: string;
+  private readonly workerToken: string;
 
-  constructor(workerUrl: string) {
+  constructor(workerUrl: string, workerToken?: string) {
     const base = workerUrl.trim().replace(/\/+$/, '');
     if (!base) throw new Error('配置 transport.curlCffiUrls 为空');
+    this.workerToken = requireWorkerToken(workerToken);
     this.endpoint = `${base}/fetch`;
   }
 
   async fetch(req: HttpRequest): Promise<HttpResponse> {
     const res = await nativeFetch(this.endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.workerToken}` },
+      redirect: 'error',
       body: JSON.stringify(req)
     });
     const text = await res.text();
@@ -441,9 +445,9 @@ export function configureTransportRuntime(config: { dataDir: string; upstreamTra
 }
 
 /** 按配置选择传输后端：配置 sidecar 则走 curl_cffi，否则直连。 */
-export function createTransport(workerUrl?: string): Transport {
+export function createTransport(workerUrl?: string, workerToken?: string): Transport {
   const baseTransport = workerUrl?.trim()
-    ? new CurlCffiTransport(workerUrl)
+    ? new CurlCffiTransport(workerUrl, workerToken)
     : new DirectTransport();
   const traceFile = resolveTraceFile();
   if (!traceFile) return baseTransport;

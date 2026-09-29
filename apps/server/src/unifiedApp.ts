@@ -71,7 +71,7 @@ export type UnifiedApp = Hono & { stopBackgroundTasks(): void };
 export async function buildUnifiedApp({ config, database, artifactStore, transport: providedTransport, accountManager: providedAccountManager, teamCode: providedTeamCode, paymentMethodBinder: providedPaymentMethodBinder, startBackgroundTasks = false }: UnifiedAppDeps): Promise<UnifiedApp> {
   const app = new Hono();
   configureTransportRuntime(config);
-  const transport = providedTransport ?? createTransport(config.curlCffiUrl);
+  const transport = providedTransport ?? createTransport(config.curlCffiUrl, config.curlCffiToken);
   const cipher = new SecretCipher(config.dataEncryptionKey, config.dataEncryptionKeyVersion);
   const artifactsStore = artifactStore ?? new ArtifactStore(config.artifactDir);
   const sessions = new SessionRepository(database, cipher);

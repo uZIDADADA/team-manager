@@ -75,7 +75,11 @@ PostgreSQL 是结构化业务数据的唯一事实源。应用启动只检查 mi
 
 ## 开发与验证
 
+VPS 生产部署见 [VPS 部署手册](./docs/guide/vps-deployment.md)：填写源码外的私有 `config.yaml` 后，运行 `./scripts/deploy.sh <私有部署目录> up`，由脚本构建镜像、等待 PostgreSQL 与 worker、执行迁移并启动应用。宿主机只需 Docker 与 Compose v2。
+
 运行配置的唯一事实源是部署目录的 `config.yaml`，结构参考 [`config.example.yaml`](./config.example.yaml)。管理员密码可以在首次迁移时填写明文，配置加载器会在跨进程锁内将其原子改写为 bcrypt cost 12；源码目录不读取 `.env`。本机完整开发实例通过部署目录的 `./tmux-dev-manager.sh` 管理。
+
+配置 curl-cffi worker 时，必须在私有 `config.yaml` 的 `transport.curlCffiToken` 填写独立随机令牌（至少 32 位 URL-safe 字符，可用 `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'` 生成）。后端从 YAML 读取，配置启动器将同一值派生为 worker 的 `TEAMMGR_CURL_CFFI_TOKEN`；自定义 Compose 启动器也必须传入此变量。缺少或无效令牌时拒绝启动，错误令牌请求返回 401。升级已有部署时先补配置，再一起更新后端和 worker，重新启动这两个进程；不要复用管理员令牌或把 worker 端口公开。worker 只请求配置允许的上游 origin，并将 3xx 原样返回，不自动跟随重定向。
 
 前端的产品级组件行为集中维护：`theme/uiPolicy.ts` 负责弹层容器、视口边界、虚拟滚动和分页数量选择器，`theme/popupPolicy.css` 只保存全局弹层定位兜底；声明式弹窗/抽屉使用 `ProductModal`、`ProductDrawer`，业务日期输入使用支持整段粘贴和快捷项的 `ProductDatePicker`，非 Table 分页使用 `ProductPagination`，所有分页状态使用 `useUrlPagination`。页面可以直接使用 Ant Design `Select` 传递业务选项，但不得自行设置弹层容器、定位、动画、虚拟滚动或分页数量选择器策略。`theme/uiPolicy.test.ts` 会阻止这些旁路重新进入源码。
 

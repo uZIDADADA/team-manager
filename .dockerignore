@@ -8,3 +8,10 @@ team-sessions
 !.env.example
 .git
 *.log
+README.local.md
+config.yaml
+config.*.yaml
+!config.example.yaml
+.idea
+.agents
+.codex

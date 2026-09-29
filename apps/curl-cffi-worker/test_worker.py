@@ -1,4 +1,9 @@
 import unittest
+import json
+from contextlib import contextmanager
+from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 from unittest.mock import MagicMock, patch
 
 import worker
@@ -41,8 +46,34 @@ class FetchPayloadTests(unittest.TestCase):
             )
 
     def test_rejects_external_or_protocol_relative_paths(self):
-        with self.assertRaisesRegex(ValueError, "absolute application path"):
-            worker.parse_fetch_payload({"method": "GET", "path": "//example.com/secret"})
+        for path in [
+            "//example.com/secret", "///example.com/secret",
+            "/http://127.0.0.1/secret", "/https://example.com/secret",
+            "/HTTP://127.0.0.1/secret", "/file:///etc/passwd",
+            "/\\example.com/secret", "/\n/127.0.0.1/secret",
+            "/\t/127.0.0.1/secret", "/backend-api/me#fragment",
+        ]:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                worker.parse_fetch_payload({"method": "GET", "path": path})
+
+    def test_preserves_valid_paths_queries_and_origins(self):
+        for base in [worker.BASE_URL, worker.CODEX_AUTH_BASE_URL]:
+            for path in ["/", "/backend-api/me?offset=0&limit=100", "/oauth/token",
+                         "/backend-api/%2F%2Fexample.com", "/?next=https://example.com"]:
+                with self.subTest(base=base, path=path):
+                    self.assertEqual(worker.upstream_url(base, path), base.rstrip("/") + path)
+
+    def test_does_not_trust_lookalike_origins(self):
+        for base in ["https://chatgpt.com.example.com", "https://chatgpt.com@127.0.0.1",
+                     "http://chatgpt.com", "https://chatgpt.com:8443"]:
+            with self.subTest(base=base), self.assertRaises(ValueError):
+                worker.parse_fetch_payload({"method": "GET", "baseUrl": base, "path": "/"})
+
+    def test_invalid_url_never_reaches_transport(self):
+        with patch.object(worker, "wire_traced_curl") as create_curl:
+            with self.assertRaises(ValueError):
+                worker.fetch_upstream({"base_url": worker.BASE_URL, "path": "/http://127.0.0.1/"})
+            create_curl.assert_not_called()
 
     def test_rejects_unsupported_methods(self):
         with self.assertRaisesRegex(ValueError, "unsupported method"):
@@ -130,7 +161,11 @@ class FetchChatGptTests(unittest.TestCase):
             verify=True,
             proxy="http://proxy.example:8080",
         )
-        session.request.assert_called_once()
+        session.request.assert_called_once_with(
+            "GET", worker.BASE_URL.rstrip("/") + "/backend-api/me",
+            headers={"Authorization": "Bearer token"}, data=None,
+            timeout=worker.REQUEST_TIMEOUT, allow_redirects=False,
+        )
 
     def test_wraps_transport_failures_with_the_complete_wire_trace(self):
         wire = [{"type": "diagnostic", "data": "Trying proxy.example:8080...\n"}]
@@ -157,6 +192,86 @@ class FetchChatGptTests(unittest.TestCase):
 
         self.assertEqual(str(raised.exception.cause), "proxy connect reset")
         self.assertEqual(raised.exception.wire, wire)
+
+
+@contextmanager
+def local_server(handler):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+class WorkerSecurityTests(unittest.TestCase):
+    def test_unauthenticated_requests_never_read_body_or_fetch(self):
+        handler = MagicMock(path="/fetch")
+        for auth in [None, "Bearer wrong", "", "Bearer 非法"]:
+            handler.headers = {} if auth is None else {"Authorization": auth}
+            with self.subTest(auth=auth), patch.object(worker, "WORKER_TOKEN", "a" * 43):
+                worker.WorkerHandler.do_POST(handler)
+                handler.write_json.assert_called_with(401, {"error": "unauthorized"})
+                handler.read_json.assert_not_called()
+
+    def test_missing_or_weak_token_fails_closed(self):
+        for token in ["", "short", "a" * 31, "a" * 32 + "\n"]:
+            with self.subTest(token=token), patch.object(worker, "WORKER_TOKEN", token):
+                with patch.object(worker, "ThreadingHTTPServer") as server:
+                    with self.assertRaisesRegex(ValueError, "TEAMMGR_CURL_CFFI_TOKEN"):
+                        worker.main()
+                    server.assert_not_called()
+                handler = MagicMock(path="/fetch")
+                worker.WorkerHandler.do_POST(handler)
+                handler.write_json.assert_called_with(503, {"error": "worker_auth_not_configured"})
+                handler.read_json.assert_not_called()
+
+    def test_authenticated_http_request_forwards_without_worker_token(self):
+        token = "test-worker-token-" + "a" * 32
+        with patch.object(worker, "WORKER_TOKEN", token), local_server(worker.WorkerHandler) as server:
+            for headers, status in [({}, 401), ({"Authorization": "Bearer wrong"}, 401),
+                                    ({"Authorization": f"Bearer {token}"}, 200)]:
+                with self.subTest(status=status), patch.object(worker, "fetch_upstream", return_value={"status": 200, "body": "ok"}) as fetch:
+                    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                    try:
+                        connection.request("POST", "/fetch", json.dumps({"method": "GET", "path": "/backend-api/me"}), headers)
+                        response = connection.getresponse()
+                        self.assertEqual(response.status, status)
+                        response.read()
+                    finally:
+                        connection.close()
+                    if status == 200:
+                        self.assertEqual(fetch.call_args.args[0]["headers"], {})
+                    else:
+                        fetch.assert_not_called()
+
+    def test_real_curl_does_not_follow_redirects(self):
+        visited = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                visited.append(self.path)
+                self.send_response(int(self.path.removeprefix("/")) if self.path != "/private" else 200)
+                self.send_header("Location", "/private")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        with local_server(Handler) as server:
+            base = f"http://127.0.0.1:{server.server_port}/"
+            with patch.object(worker, "ALLOWED_BASE_URLS", {base}), patch.object(worker, "PROXY_URL", ""):
+                for status in [301, 302, 303, 307, 308]:
+                    with self.subTest(status=status):
+                        result = worker.fetch_upstream({"method": "GET", "base_url": base,
+                            "path": f"/{status}", "headers": {}, "body": None, "proxy": None})
+                        self.assertEqual(result["status"], status)
+                        self.assertEqual(result["network"]["redirectCount"], 0)
+            self.assertEqual(visited, ["/301", "/302", "/303", "/307", "/308"])
 
 
 if __name__ == "__main__":

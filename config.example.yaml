@@ -6,7 +6,7 @@ server:
   artifactDir: ./data/artifacts
   webDistDirs:
     development: ./source/apps/web/dist
-    compose: ./apps/web/dist
+    compose: /app/apps/web/dist
   dataEncryptionKey: replace-with-32-byte-key
   dataEncryptionKeyVersion: v1
   jwtSecret: replace-with-random-secret
@@ -48,6 +48,8 @@ integrations:
     billingPostalCode: null
     billingRegion: null
 transport:
+  # 配置 worker 时必填；使用随机生成的至少 32 位 URL-safe 令牌，勿复用管理员令牌。
+  curlCffiToken: null
   curlCffiUrls:
     development: http://127.0.0.1:3011
     compose: http://curl-cffi-worker:8080

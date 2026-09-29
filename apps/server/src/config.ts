@@ -2,6 +2,7 @@ import { constants } from 'node:fs';
 import { mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { requireWorkerToken } from './auth/workerToken.js';
 import { isAlias, isMap, parseDocument, type Document, type Node } from 'yaml';
 import {
   assertPasswordFitsBcrypt,
@@ -42,6 +43,7 @@ export interface AppConfig {
   paymentBillingPostalCode?: string;
   paymentBillingRegion?: string;
   curlCffiUrl?: string;
+  curlCffiToken?: string;
   upstreamTraceFile?: string;
 }
 
@@ -117,7 +119,7 @@ export function parseRuntimeConfig(raw: string, configPath: string, profile: Run
   const teamCode = strictObject(integrations.teamCode, 'integrations.teamCode', ['baseUrl', 'passcode']);
   const stripe = strictObject(integrations.stripe, 'integrations.stripe', ['publishableKeys', 'paymentUserAgent', 'walletConfigId']);
   const payment = strictObject(integrations.payment, 'integrations.payment', ['httpProxyHosts', 'billingPostalCode', 'billingRegion']);
-  const transport = strictObject(root.transport, 'transport', ['curlCffiUrls', 'upstreamTraceFile']);
+  const transport = strictObject(root.transport, 'transport', ['curlCffiUrls', 'curlCffiToken', 'upstreamTraceFile']);
   const deployment = strictObject(root.deployment, 'deployment', ['postgres', 'worker', 'web']);
   const deployPostgres = strictObject(deployment.postgres, 'deployment.postgres', ['publishedPort']);
   const worker = strictObject(deployment.worker, 'deployment.worker', ['chatgptBaseUrl', 'chatgptProxy', 'impersonate', 'requestTimeoutSeconds', 'ports']);
@@ -149,6 +151,9 @@ export function parseRuntimeConfig(raw: string, configPath: string, profile: Run
   const paymentBillingPostalCode = optionalText(payment.billingPostalCode);
   const paymentBillingRegion = optionalText(payment.billingRegion);
   const curlCffiUrl = optionalProfileText(curlCffiUrls[profile]);
+  const configuredWorkerToken = optionalText(transport.curlCffiToken);
+  const curlCffiToken = curlCffiUrl || configuredWorkerToken
+    ? requireWorkerToken(configuredWorkerToken) : undefined;
   const upstreamTraceFile = optionalPath(transport.upstreamTraceFile, configDir);
   const workerProxy = optionalText(worker.chatgptProxy);
   return {
@@ -177,6 +182,7 @@ export function parseRuntimeConfig(raw: string, configPath: string, profile: Run
       ...(paymentBillingPostalCode ? { paymentBillingPostalCode } : {}),
       ...(paymentBillingRegion ? { paymentBillingRegion } : {}),
       ...(curlCffiUrl ? { curlCffiUrl } : {}),
+      ...(curlCffiToken ? { curlCffiToken } : {}),
       ...(upstreamTraceFile ? { upstreamTraceFile } : {}),
     },
     deployment: {

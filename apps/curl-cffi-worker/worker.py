@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from hmac import compare_digest
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from curl_cffi import Curl, CurlOpt, requests
 from curl_cffi.curl import CURLINFO_HEADER_IN, CURLINFO_HEADER_OUT, CURLINFO_TEXT
@@ -18,6 +20,7 @@ PROXY_URL = os.environ.get("TEAMMGR_CHATGPT_PROXY", "").strip()
 IMPERSONATE = os.environ.get("TEAMMGR_CURL_CFFI_IMPERSONATE", "chrome110").strip() or "chrome110"
 REQUEST_TIMEOUT = float(os.environ.get("TEAMMGR_CURL_CFFI_TIMEOUT", "60"))
 PORT = int(os.environ.get("TEAMMGR_CURL_CFFI_PORT", "8080"))
+WORKER_TOKEN = os.environ.get("TEAMMGR_CURL_CFFI_TOKEN", "").strip()
 ALLOWED_METHODS = {"GET", "POST", "PATCH", "DELETE"}
 WIRE_EVENT_NAMES = {
     CURLINFO_TEXT: "diagnostic",
@@ -55,6 +58,14 @@ class WorkerHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self.path != "/fetch":
             self.write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        # Authenticate before reading a body or accepting a caller-selected proxy.
+        if not valid_worker_token(WORKER_TOKEN):
+            self.write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "worker_auth_not_configured"})
+            return
+        authorization = self.headers.get("Authorization", "")
+        if not compare_digest(authorization.encode("utf-8"), f"Bearer {WORKER_TOKEN}".encode("utf-8")):
+            self.write_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
         try:
             request = parse_fetch_payload(self.read_json())
@@ -94,6 +105,39 @@ class WorkerHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
+def valid_worker_token(token: str) -> bool:
+    return re.fullmatch(r"[A-Za-z0-9_-]{32,}", token) is not None
+
+
+def upstream_url(base_url: str, path: str) -> str:
+    if base_url not in ALLOWED_BASE_URLS:
+        raise ValueError("unsupported upstream base URL")
+    if (
+        not path.startswith("/")
+        or path.startswith("//")
+        or "\\" in path
+        or any(ord(char) <= 32 or ord(char) == 127 for char in path)
+        or urlsplit(path[1:]).scheme
+        or urlsplit(path).fragment
+    ):
+        raise ValueError("path must be an absolute application path")
+    base = urlsplit(base_url)
+    # Keep the leading slash: stripping it can turn /https://... into a URL.
+    url = urljoin(base_url, path)
+    target = urlsplit(url)
+    if (
+        base.scheme not in {"https", "http"}
+        or not base.hostname
+        or base.username is not None
+        or base.password is not None
+        or (target.scheme, target.hostname, target.port) != (base.scheme, base.hostname, base.port)
+        or target.username is not None
+        or target.password is not None
+    ):
+        raise ValueError("unsupported upstream origin")
+    return url
+
+
 def parse_fetch_payload(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("request body must be a JSON object")
@@ -101,11 +145,8 @@ def parse_fetch_payload(payload: Any) -> dict[str, Any]:
     if method not in ALLOWED_METHODS:
         raise ValueError(f"unsupported method: {method or '<empty>'}")
     path = str(payload.get("path") or "")
-    if not path.startswith("/") or path.startswith("//"):
-        raise ValueError("path must be an absolute application path")
     base_url = str(payload.get("baseUrl") or BASE_URL).rstrip("/") + "/"
-    if base_url not in ALLOWED_BASE_URLS:
-        raise ValueError("unsupported upstream base URL")
+    upstream_url(base_url, path)
     headers = payload.get("headers") or {}
     if not isinstance(headers, dict):
         raise ValueError("headers must be an object")
@@ -126,7 +167,7 @@ def parse_fetch_payload(payload: Any) -> dict[str, Any]:
 
 
 def fetch_upstream(request: dict[str, Any]) -> dict[str, Any]:
-    url = urljoin(request["base_url"], request["path"].lstrip("/"))
+    url = upstream_url(request["base_url"], request["path"])
     curl, wire = wire_traced_curl()
     session_kwargs: dict[str, Any] = {
         "curl": curl,
@@ -144,6 +185,8 @@ def fetch_upstream(request: dict[str, Any]) -> dict[str, Any]:
                 headers=request["headers"],
                 data=request["body"],
                 timeout=REQUEST_TIMEOUT,
+                # Return 3xx to the caller; never follow an unchecked Location.
+                allow_redirects=False,
             )
     except Exception as exc:
         raise UpstreamFetchError(exc, wire) from exc
@@ -200,6 +243,8 @@ def header_items(headers: Any) -> list[list[str | None]]:
 
 
 def main() -> None:
+    if not valid_worker_token(WORKER_TOKEN):
+        raise ValueError("TEAMMGR_CURL_CFFI_TOKEN must contain at least 32 URL-safe characters")
     server = ThreadingHTTPServer(("0.0.0.0", PORT), WorkerHandler)
     print(f"[curl-cffi-worker] listening on 0.0.0.0:{PORT}", flush=True)
     server.serve_forever()
