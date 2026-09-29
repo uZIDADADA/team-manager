@@ -81,6 +81,10 @@ VPS 生产部署见 [VPS 部署手册](./docs/guide/vps-deployment.md)：填写�
 
 配置 curl-cffi worker 时，必须在私有 `config.yaml` 的 `transport.curlCffiToken` 填写独立随机令牌（至少 32 位 URL-safe 字符，可用 `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'` 生成）。后端从 YAML 读取，配置启动器将同一值派生为 worker 的 `TEAMMGR_CURL_CFFI_TOKEN`；自定义 Compose 启动器也必须传入此变量。缺少或无效令牌时拒绝启动，错误令牌请求返回 401。升级已有部署时先补配置，再一起更新后端和 worker，重新启动这两个进程；不要复用管理员令牌或把 worker 端口公开。worker 只请求配置允许的上游 origin，并将 3xx 原样返回，不自动跟随重定向。
 
+登录入口按实际 socket 来源限制为每分钟 10 次、每进程每分钟 60 次，最多同时处理 2 个登录请求且同一来源最多 1 个。连续失败达到 3 次后，从 1 秒开始指数退避，最多等待 60 秒；429 响应包含 `Retry-After`，被拒绝的重试不会延长冷却。成功登录清除失败退避，15 分钟无已接纳尝试后清除来源记录；登录请求体限制为 4 KiB，并在 5 秒内完成读取。限流不信任 `X-Forwarded-For` 等请求头，反向代理后的访问会共用代理 socket 来源配额。计数保存在当前进程内，重启会清空，多实例部署仍应在可信入口配置共享限流。
+
+Vite 开发服务只监听 `127.0.0.1`，并使用默认 Host 白名单（localhost、其子域和 IP 地址），不接受任意域名。远程开发通过 SSH 端口转发后使用本机地址访问；生产使用构建后的静态文件。开发安全检查可运行 `corepack pnpm --filter @team-manager/web test:security`，会短暂启动回环地址上的测试服务。
+
 前端的产品级组件行为集中维护：`theme/uiPolicy.ts` 负责弹层容器、视口边界、虚拟滚动和分页数量选择器，`theme/popupPolicy.css` 只保存全局弹层定位兜底；声明式弹窗/抽屉使用 `ProductModal`、`ProductDrawer`，业务日期输入使用支持整段粘贴和快捷项的 `ProductDatePicker`，非 Table 分页使用 `ProductPagination`，所有分页状态使用 `useUrlPagination`。页面可以直接使用 Ant Design `Select` 传递业务选项，但不得自行设置弹层容器、定位、动画、虚拟滚动或分页数量选择器策略。`theme/uiPolicy.test.ts` 会阻止这些旁路重新进入源码。
 
 ```bash

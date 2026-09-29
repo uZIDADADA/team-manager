@@ -7,7 +7,8 @@ export default defineConfig(() => {
   return {
     plugins: [react()],
     server: {
-      allowedHosts: true,
+      host: '127.0.0.1',
+      allowedHosts: [],
       ...(apiTarget
         ? {
             proxy: {

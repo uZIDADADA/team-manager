@@ -7,8 +7,8 @@ import { relative } from 'node:path';
 import type { Kysely } from 'kysely';
 import type { AppConfig } from './config.js';
 import type { Database } from './database/schema.js';
-import { verifyJwt, signJwt } from './auth/jwt.js';
-import { verifyPasswordHash } from './auth/password.js';
+import { verifyJwt } from './auth/jwt.js';
+import { createLoginRoutes } from './auth/login.js';
 import { ArtifactStore } from './artifactStore.js';
 import { SecretCipher } from './secretCipher.js';
 import { AccountOperationalRepository } from './repositories/accountOperationalRepository.js';
@@ -131,7 +131,6 @@ export async function buildUnifiedApp({ config, database, artifactStore, transpo
     const notificationTimer = setInterval(() => void notifications.retryFailed().catch((error) => console.warn('[team-manager] 通知重试失败:', error)), 60_000);
     notificationTimer.unref(); stops.push(() => clearInterval(notificationTimer));
   }
-  const adminHash = config.adminPasswordHash;
 
   if (config.allowedOrigins.length > 0) {
     app.use('*', cors({
@@ -147,16 +146,7 @@ export async function buildUnifiedApp({ config, database, artifactStore, transpo
     if (!body.email) return c.json({ ok: false, error: '缺少邮箱' }, 400);
     return wrapPublic(c, () => publicSeats.swap(c.req.param('seatKey'), body.email!));
   });
-  app.post('/api/auth/login', async (c) => {
-    const body = await c.req.json().catch(() => ({})) as { username?: string; password?: string };
-    if (!body.username || !body.password) return c.json({ ok: false, error: '缺少用户名或密码' }, 400);
-    if (body.username !== config.adminUsername || !adminHash || !(await verifyPasswordHash(body.password, adminHash))) {
-      return c.json({ ok: false, error: '用户名或密码错误' }, 401);
-    }
-    return c.json({ ok: true, data: { token: signJwt({
-      subject: body.username, issuer: config.jwtIssuer, tokenType: 'access', secret: config.jwtSecret
-    }) } });
-  });
+  app.route('/api/auth', createLoginRoutes(config));
 
   const api = new Hono();
   api.use('*', async (c, next) => {
