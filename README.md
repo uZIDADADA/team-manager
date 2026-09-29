@@ -73,9 +73,120 @@ PostgreSQL 是结构化业务数据的唯一事实源。应用启动只检查 mi
 | `packages/shared` | 新版前后端共享合同与 Session 解析 |
 | `docs` | 领域规则、操作手册、协议样本和实施计划 |
 
-## 开发与验证
+## VPS 生产启动
 
-VPS 生产部署见 [VPS 部署手册](./docs/guide/vps-deployment.md)：填写源码外的私有 `config.yaml` 后，运行 `./scripts/deploy.sh <私有部署目录> up`，由脚本构建镜像、等待 PostgreSQL 与 worker、执行迁移并启动应用。宿主机只需 Docker 与 Compose v2。
+以下命令在 VPS 的 Bash 中执行，默认已安装 Docker Engine、Compose 插件（支持 `up --wait`）和 Git，当前用户有 Docker 操作权限。不需要在宿主机安装 Node、pnpm 或 Python。本节不包含 Docker 安装步骤。
+
+### 准备源码和私有配置
+
+首次部署先选择两个独立目录，运行目录必须在源码目录之外。真实路径和秘密只保存在 VPS，不提交到仓库：
+
+```bash
+read -r -p '源码目录（绝对路径）: ' TM_SOURCE_DIR
+read -r -p '私有运行目录（绝对路径）: ' TM_DEPLOY_DIR
+git clone --branch dev --single-branch https://github.com/uZIDADADA/team-manager.git "$TM_SOURCE_DIR"
+cd "$TM_SOURCE_DIR"
+install -d -m 700 "$TM_DEPLOY_DIR"
+if [ ! -e "$TM_DEPLOY_DIR/config.yaml" ]; then
+  cp config.example.yaml "$TM_DEPLOY_DIR/config.yaml"
+fi
+chmod 600 "$TM_DEPLOY_DIR/config.yaml"
+```
+
+已有源码时进入原目录，执行 `git switch dev`、`git pull --ff-only origin dev`；已有运行配置时继续使用原文件，不覆盖它。重新登录终端后，需要重新设置 `TM_SOURCE_DIR` 和 `TM_DEPLOY_DIR` 为实际路径。
+
+编辑私有 `config.yaml`，按 [配置模板](./config.example.yaml) 填写：
+
+| 字段 | 内容 |
+|---|---|
+| `server.dataEncryptionKey` | 独立随机 32 字节密钥，64 位 hex 或 base64 |
+| `server.jwtSecret` | 独立随机密钥，至少 32 字符 |
+| `admin.username` / `admin.password` | 后台用户名和密码，明文密码不超过 72 UTF-8 字节 |
+| `database.password` | 独立随机数据库密码 |
+| `transport.curlCffiToken` | 独立随机令牌，至少 32 位字母、数字、下划线或连字符 |
+
+首次部署空实例时可以生成四个独立密钥，再分别填写到上表对应位置：
+
+```bash
+docker run --rm node:22-bookworm-slim node -e '
+const { randomBytes } = require("node:crypto");
+for (const key of ["dataEncryptionKey", "jwtSecret", "databasePassword", "curlCffiToken"])
+  console.log(key + ": " + randomBytes(32).toString("hex"));
+'
+```
+
+不要公开输出或重新生成已有数据的加密密钥。管理员明文密码在首次读取配置时自动转为 bcrypt。
+
+GAM（GPT Account Manager）是独立的注册、浏览器 Profile 和代理管理服务，不是启动必需项。暂不连接时，将 `integrations.accountManager.baseUrls.compose` 与 `integrations.accountManager.token` 设为 `null`，保留其他集成字段。Team Manager 仍可管理已导入有效 Session 的账号；依赖 GAM 的功能暂不可用。
+
+其余 Compose 内部地址和目录先保留模板值，尤其是 `server.webDistDirs.compose`、数据库地址和 worker 地址。应用只读取 YAML，不读取旧 `.env.example`。
+
+### 启动和检查
+
+```bash
+cd "$TM_SOURCE_DIR"
+./scripts/deploy.sh "$TM_DEPLOY_DIR" up
+./scripts/deploy.sh "$TM_DEPLOY_DIR" ps
+./scripts/deploy.sh "$TM_DEPLOY_DIR" logs --tail 100 team-manager
+read -r -p 'config.yaml 中的 server.port: ' TM_APP_PORT
+curl -fsS "http://127.0.0.1:$TM_APP_PORT/health"
+```
+
+`up` 会构建应用和 worker，校验配置，停止旧应用，等待 PostgreSQL 与 worker 健康，执行迁移，再启动应用并等待健康检查。迁移失败会停止后续启动；修复错误后重新执行 `up`。`/health` 返回包含 `"ok":true` 的 JSON 表示应用可响应，接着验证首页、登录和所需业务功能。
+
+必须通过脚本启动：脚本从同一份 YAML 派生 Compose 所需配置，不能直接用裸 `docker compose up -d` 替代。前端由后端提供，不需要单独运行 Vite。
+
+### Nginx 对外访问
+
+如果 Nginx 安装在同一台 VPS 的宿主机上，在现有 HTTPS 站点的 `server` 块内配置以下内容；将 `<server.port>` 替换为私有 YAML 中的实际端口。这是模板片段，不能原样加载占位符：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:<server.port>;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 120s;
+}
+```
+
+前端页面和 `/api` 都通过同一个入口代理。域名解析到 VPS，Nginx 站点配置证书和 HTTPS，公网仅放通 Nginx 的 HTTP/HTTPS 入口及原有 SSH 端口。应用端口保持 Compose 的 `127.0.0.1` 绑定，不必额外开放公网访问；PostgreSQL 和 worker 也不发布公网端口。
+
+修改宿主机 Nginx 配置后校验并重载：
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+如果 Nginx 运行在另一个容器里，其 `127.0.0.1` 指向 Nginx 容器自身，以上地址不适用；需将 Nginx 接入应用的 Docker 网络，使用应用服务名和容器端口作为上游。当前登录限流仍按实际 socket 来源计数，不信任转发头，代理后的访问会共享来源配额。代理指令参考 [Nginx 官方文档](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_pass)。
+
+### 更新、日志和停止
+
+更新前按 [备份与恢复说明](./docs/guide/vps-deployment.md#备份、搬迁与恢复) 联合备份数据库、私有配置及文件制品，再执行：
+
+```bash
+cd "$TM_SOURCE_DIR"
+git pull --ff-only origin dev
+./scripts/deploy.sh "$TM_DEPLOY_DIR" up
+./scripts/deploy.sh "$TM_DEPLOY_DIR" db-status
+```
+
+以下命令按需执行：
+
+```bash
+# 持续查看日志，Ctrl+C 退出日志查看，不停止服务
+./scripts/deploy.sh "$TM_DEPLOY_DIR" logs -f --tail 100 team-manager
+# 停止服务，保留数据
+./scripts/deploy.sh "$TM_DEPLOY_DIR" stop
+# 删除容器和网络，保留数据库卷及运行目录
+./scripts/deploy.sh "$TM_DEPLOY_DIR" down
+```
+
+重新启动使用同一个 `up` 命令。升级继续使用原 `config.yaml`，不重新生成加密密钥；单实例升级在执行迁移时会短暂停机。完整目录约束、外部集成和备份流程见 [VPS 部署手册](./docs/guide/vps-deployment.md)。
+
+## 开发与验证
 
 运行配置的唯一事实源是部署目录的 `config.yaml`，结构参考 [`config.example.yaml`](./config.example.yaml)。管理员密码可以在首次迁移时填写明文，配置加载器会在跨进程锁内将其原子改写为 bcrypt cost 12；源码目录不读取 `.env`。本机完整开发实例通过部署目录的 `./tmux-dev-manager.sh` 管理。
 
